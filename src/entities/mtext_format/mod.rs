@@ -90,7 +90,7 @@
 //!
 //! // Serialize back to MTEXT format
 //! let output = doc.to_mtext_string();
-//! assert!(output.contains("\\C5;;"));
+//! assert!(output.contains("\\C5;"));
 //! ```
 
 pub mod parser;

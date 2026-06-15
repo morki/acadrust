@@ -13,6 +13,7 @@ use super::types::*;
 ///
 /// Recognizes all control codes whether or not the content is wrapped in
 /// `{...}`. Matches the behavior of AutoCAD MTEXT and MLEADER entities.
+///
 /// # Arguments
 ///
 /// * `input` - The MTEXT format string to parse.
@@ -152,6 +153,7 @@ impl MTextParser {
         self.document
             .push_paragraph(std::mem::take(&mut self.current_paragraph));
     }
+
     /// Push a copy of the current context onto the stack.
     fn push_ctx(&mut self) {
         if let Some(props) = self.ctx_stack.last() {
@@ -327,9 +329,9 @@ impl MTextParser {
                 self.flush_current_span(false);
                 self.document
                     .push_paragraph(std::mem::take(&mut self.current_paragraph));
-                // Reset properties for the new paragraph
-                self.current_props_mut()
-                    .clone_from(&SpanProperties::default());
+                // Span properties (color, font, bold, height, etc.) carry over
+                // to the next paragraph. Only paragraph-level properties are
+                // per-paragraph (set via \p...; control codes).
             }
 
             // \p...; → paragraph properties, or \p alone → paragraph break
@@ -344,8 +346,7 @@ impl MTextParser {
                 self.flush_current_span(false);
                 self.document
                     .push_paragraph(std::mem::take(&mut self.current_paragraph));
-                self.current_props_mut()
-                    .clone_from(&SpanProperties::default());
+                // Span properties carry over, same as \P
             }
 
             // Wrap at dimension line (skip, no output)
@@ -687,19 +688,14 @@ impl MTextParser {
         }
 
         // For stacking, we emit the text inline with a slash
-        let plain = match stacking_type {
-            StackingType::Horizontal => format!("{}/{}", numerator, denominator),
-            StackingType::Diagonal => format!("{}/{}", numerator, denominator),
-            StackingType::Limit => format!("{} {}", numerator, denominator),
-        };
-
         let stacking = StackingData {
             numerator,
             denominator,
             stacking_type,
         };
 
-        let span = MTextSpan::stacking(plain, stacking);
+        // Stacking spans have empty text — the plain text is derived from stacking data
+        let span = MTextSpan::stacking("", self.current_props().clone(), stacking);
         self.current_paragraph.push_span(span);
     }
 
@@ -1311,10 +1307,13 @@ mod tests {
     // ========================================================================
 
     #[test]
+
     fn test_parse_stacking_fraction() {
         let doc = parse_mtext(r"{\S1/4;}", false);
         assert_eq!(doc.paragraphs[0].spans.len(), 1);
-        assert_eq!(doc.paragraphs[0].spans[0].text, "1/4");
+        // Stacking spans have empty text — plain text derived from stacking data
+        assert_eq!(doc.paragraphs[0].spans[0].text, "");
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "1/4");
         assert!(doc.paragraphs[0].spans[0].stacking.is_some());
         let stack = doc.paragraphs[0].spans[0].stacking.as_ref().unwrap();
         assert_eq!(stack.numerator, "1");
@@ -1337,6 +1336,70 @@ mod tests {
         assert_eq!(stack.numerator, "max");
         // space after ^ is consumed
         assert_eq!(stack.denominator, "n");
+    }
+
+    #[test]
+    fn test_stacking_roundtrip() {
+        // Verify stacking parses, serializes, and re-parses correctly
+        let cases = &[
+            (r"{\S1/2;}", r"{\S1/2;}"),
+            (r"{\S3/4;}", r"{\S3/4;}"),
+            (r"{\S1#4;}", r"{\S1#4;}"),
+            (r"{\Smax^ n;}", r"{\Smax^n;}"),
+        ];
+
+        for (input, expected) in cases {
+            let doc = parse_mtext(input, false);
+            let serialized = doc.to_mtext_string();
+            assert_eq!(
+                serialized, *expected,
+                "Serialization mismatch for input {:?}",
+                input
+            );
+
+            let reparsed = parse_mtext(&serialized, false);
+            assert_eq!(
+                reparsed.paragraphs.len(),
+                doc.paragraphs.len(),
+                "Paragraph count mismatch for input {:?}",
+                input
+            );
+            assert_eq!(
+                reparsed.paragraphs[0].to_plain_text(),
+                doc.paragraphs[0].to_plain_text(),
+                "Plain text mismatch for input {:?}",
+                input
+            );
+            assert_eq!(
+                reparsed.paragraphs[0].spans[0].stacking, doc.paragraphs[0].spans[0].stacking,
+                "Stacking data mismatch for input {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_stacking_inherits_properties() {
+        // Stacking spans should inherit color/font/stroke from current context
+        let doc = parse_mtext(r"{\C1;\L\S1/2;}", false);
+        let span = &doc.paragraphs[0].spans[0];
+        assert!(span.stacking.is_some());
+        assert_eq!(span.properties.color, Some(MTextColor::Index(1)));
+        assert!(span.properties.stroke.underline());
+
+        // Roundtrip must preserve both stacking and properties
+        let serialized = doc.to_mtext_string();
+        let reparsed = parse_mtext(&serialized, false);
+        let reparsed_span = &reparsed.paragraphs[0].spans[0];
+        assert_eq!(reparsed_span.properties.color, span.properties.color);
+        assert_eq!(
+            reparsed_span.properties.stroke, span.properties.stroke,
+            "Stroke not preserved after roundtrip"
+        );
+        assert!(
+            reparsed_span.stacking.is_some(),
+            "Stacking data lost after roundtrip"
+        );
     }
 
     // ========================================================================
@@ -1688,15 +1751,11 @@ mod tests {
         assert_eq!(doc.paragraphs[0].spans.len(), 1);
     }
 
-    // ========================================================================
-    // Roundtrip
-    // ========================================================================
-
     #[test]
     fn test_roundtrip_simple_formatted() {
         let doc = parse_mtext("{\\C1;Red\\C0;; normal}", false);
         let s = doc.to_mtext_string();
-        assert!(s.contains("\\C1;;"));
+        assert!(s.contains("\\C1;"));
     }
 
     #[test]
@@ -1760,5 +1819,371 @@ mod tests {
         let doc = parse_mtext("\\fArial;Hello", false);
         assert_eq!(doc.paragraphs[0].to_plain_text(), "Hello");
         assert!(doc.paragraphs[0].spans[0].properties.font.is_some());
+    }
+
+    // ========================================================================
+    // Style inheritance across paragraphs
+    // ========================================================================
+
+    #[test]
+    fn test_color_carries_across_paragraphs() {
+        // {\C1;First\PSecond} → both paragraphs should be red (aci=1)
+        let doc = parse_mtext("{\\C1;First\\PSecond}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            doc.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_font_carries_across_paragraphs() {
+        let doc = parse_mtext("{\\fArial;First\\PSecond}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert!(doc.paragraphs[0].spans[0].properties.font.is_some());
+        assert!(doc.paragraphs[1].spans[0].properties.font.is_some());
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.font,
+            doc.paragraphs[1].spans[0].properties.font
+        );
+    }
+
+    #[test]
+    fn test_underline_carries_across_paragraphs() {
+        let doc = parse_mtext("{\\LUnderlined\\PStill underlined}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert!(doc.paragraphs[0].spans[0].properties.stroke.underline());
+        assert!(doc.paragraphs[1].spans[0].properties.stroke.underline());
+    }
+
+    #[test]
+    fn test_height_carries_across_paragraphs() {
+        let doc = parse_mtext("{\\H2;Tall\\PStill tall}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].spans[0].properties.height, Some(2.0));
+        assert_eq!(doc.paragraphs[1].spans[0].properties.height, Some(2.0));
+    }
+
+    #[test]
+    fn test_style_change_in_second_paragraph() {
+        // Color changes mid-document
+        let doc = parse_mtext("{\\C1;Red\\P\\C5;Blue}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            doc.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(5))
+        );
+    }
+
+    #[test]
+    fn test_brace_group_resets_style() {
+        // Inner group pops context, restoring outer style
+        let doc = parse_mtext("{\\C1;Red{\\C5;Blue}Red again}", false);
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans.len(), 3);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            doc.paragraphs[0].spans[1].properties.color,
+            Some(MTextColor::Index(5))
+        );
+        // After inner group pops, outer color should restore
+        assert_eq!(
+            doc.paragraphs[0].spans[2].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_plain_text_braces_are_literal() {
+        // In plain mode, braces are literal text
+        let doc = parse_plain_text("{\\C1;Red}");
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "{\\C1;Red}");
+    }
+
+    #[test]
+    fn test_new_column_carries_style() {
+        let doc = parse_mtext("{\\C1;First\\NSecond}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            doc.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_complex_roundtrip_stable() {
+        // Complex MTEXT with:
+        // - Red color spanning first 2 paragraphs
+        // - Underline on paragraph 1 only, turned off for paragraph 2
+        // - Font change in paragraph 2
+        // - Color reset + blue in paragraph 3
+        // - Underline on/off in paragraph 3
+        let input = r"{\C1;\LRed and underlined\l\P\fArial;Red Arial\P\C5;Blue \Lbold\l}";
+        let doc = parse_mtext(input, false);
+
+        // Verify structure
+        assert_eq!(doc.paragraphs.len(), 3);
+
+        // Para 0: red + underline
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert!(doc.paragraphs[0].spans[0].properties.stroke.underline());
+
+        // Para 1: red + font Arial, underline OFF
+        assert_eq!(doc.paragraphs[1].spans.len(), 1);
+        assert_eq!(
+            doc.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert!(doc.paragraphs[1].spans[0].properties.font.is_some());
+        assert!(!doc.paragraphs[1].spans[0].properties.stroke.underline());
+
+        // Para 2: blue, then bold underline, then back to blue
+        assert_eq!(doc.paragraphs[2].spans.len(), 2);
+        assert_eq!(
+            doc.paragraphs[2].spans[0].properties.color,
+            Some(MTextColor::Index(5))
+        );
+
+        // Roundtrip: parse -> serialize -> parse must match
+        let serialized = doc.to_mtext_string();
+
+        let reparsed = parse_mtext(&serialized, false);
+
+        // Same paragraph count
+        assert_eq!(reparsed.paragraphs.len(), doc.paragraphs.len());
+        // Same plain text content
+        assert_eq!(
+            reparsed.to_plain_text(),
+            doc.to_plain_text(),
+            "Plain text mismatch after roundtrip"
+        );
+        // Same color on each paragraph's first span
+        for (i, (orig, reparsed)) in doc
+            .paragraphs
+            .iter()
+            .zip(reparsed.paragraphs.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                orig.spans.first().map(|s| &s.properties.color),
+                reparsed.spans.first().map(|s| &s.properties.color),
+                "Color mismatch in paragraph {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_corpus_roundtrip_semantic_equivalence() {
+        // Each entry: (description, input_mtext_string)
+        let cases: &[(&str, &str)] = &[
+            // Basic features
+            ("plain text", r"{Simple text}"),
+            ("special chars", r"{%%c100%%d%%p2}"),
+            ("paragraph break", r"{Line1\PLine2}"),
+            ("color change", r"{\C1;Red\C5;Blue\C3;Green}"),
+            ("font change", r"{\fArial;Arial\fTimes New Roman;Times}"),
+            ("underline", r"{\LUnderlined\lNormal}"),
+            ("overline", r"{\OOverlined\oNormal}"),
+            ("strikethrough", r"{\KStruck\kNormal}"),
+            ("height", r"{\H2;Tall\H1;Normal}"),
+            ("width factor", r"{\W2;Wide\W1;Normal}"),
+            ("tracking", r"{\T0.5;Spread\T0;Normal}"),
+            ("oblique", r"{\Q10;Slanted\Q0;Normal}"),
+            ("line alignment", r"{\A1;Middle\A0;Bottom}"),
+            // Escaping
+            ("escaped brace", r"{\{Literal brace\}}"),
+            ("escaped backslash", r"{Two\\One}"),
+            // Stacking
+            ("horizontal fraction", r"{\S1/2;fraction}"),
+            ("limit style", r"{\Smax/;limits}"),
+            ("diagonal fraction", r"{\S1/2#;diag}"),
+            // Unicode
+            ("unicode escape", r"{\U+2603;Snowflake}"),
+            // Paragraph properties
+            ("center alignment", r"{\pqc;Centered}"),
+            ("first line indent", r"{\pi0.5;Indented}"),
+            ("left margin", r"{\pl1.0;Margin}"),
+            ("right margin", r"{\pr2.0;Rmargin}"),
+            ("spacing before", r"{\pb0.3;Before}"),
+            ("spacing after", r"{\pa0.2;After}"),
+            ("exact line spacing", r"{\pse0.4;Exact}"),
+            ("multiple line spacing", r"{\psm1.5;Multiple}"),
+            ("tab stops", r"{\pt2,4,6;Tabs}"),
+            (
+                "all paragraph props",
+                r"{\pqc,i0.5,l0.3,r0.5,b0.1,a0.1,se0.5,t2,4;All}",
+            ),
+            // Multi-paragraph with style inheritance
+            ("color across paras", r"{\C1;Para1\PPara2\PPara3}"),
+            ("font across paras", r"{\fArial;Para1\PPara2}"),
+            ("underline across paras", r"{\LPara1\PPara2\l\PPara3}"),
+            // Mixed features in multiple paragraphs
+            (
+                "multi-para mixed styles",
+                r"{\C1;\LRed underline\P\fArial;Red Arial\P\C5;Blue normal\l}",
+            ),
+            ("brace group restore", r"{\C1;Red{\C5;Blue}Back to red}"),
+            (
+                "nested brace groups",
+                r"{\C1;Red{\fArial;Blue Arial{\C3;Green}}}",
+            ),
+            ("stacking in paragraphs", r"{\S1/2;\P\S3/4;second frac}"),
+            ("special chars in color", r"{\C1;%%c100%%d\P%%p20%%d}"),
+            // Edge cases
+            ("empty string", r"{}"),
+            ("only paragraph break", r"{\P}"),
+            ("multiple paragraph breaks", r"{A\P\P\PC}"),
+            ("trailing paragraph break", r"{A\PB\P}"),
+            ("unicode and color", r"{\C1;\U+2603;\C5;\U+2601;}"),
+            ("all strokes together", r"{\L\O\KAll three\k\o\l}"),
+            ("height and width", r"{\H2;\W1.5;Tall and wide}"),
+            // Real-world style MTEXT
+            ("dimension-style", r"{\C1;\H1.5;Dimension\S1/2; value}"),
+            (
+                "titleblock-style",
+                r"{\fArial,b1;\H3;Title\P\fArial;\H1.5;Subtitle}",
+            ),
+            (
+                "notes-style",
+                r"{\fArial;\H1.5;1. First note\P2. Second note\P3. Third note}",
+            ),
+            // New column
+            ("new column", r"{Column1\P\NColumn2}"),
+            // Plain text mode
+            ("plain no braces", r"Simple plain text"),
+            ("plain with percent", r"%%c%%d%%p"),
+        ];
+
+        for (name, input) in cases {
+            // Parse
+            let doc = parse_mtext(input, false);
+
+            // Skip empty documents for further checks
+            if doc.paragraphs.is_empty() {
+                continue;
+            }
+
+            // Serialize
+            let serialized = doc.to_mtext_string();
+
+            // Skip cases that serialize to empty/minimal (no content to roundtrip)
+            if serialized.is_empty() || serialized == "{}" || serialized == r"\P" {
+                continue;
+            }
+
+            // Re-parse
+            let reparsed = parse_mtext(&serialized, false);
+
+            // Semantic equivalence checks
+            assert_eq!(
+                reparsed.paragraphs.len(),
+                doc.paragraphs.len(),
+                "[{}] Paragraph count mismatch: {} vs {}",
+                name,
+                reparsed.paragraphs.len(),
+                doc.paragraphs.len()
+            );
+
+            assert_eq!(
+                reparsed.to_plain_text(),
+                doc.to_plain_text(),
+                "[{}] Plain text mismatch after roundtrip:\n  original:   {:?}\n  reparsed:   {:?}",
+                name,
+                doc.to_plain_text(),
+                reparsed.to_plain_text()
+            );
+
+            // Check each paragraph
+            for (pi, (orig_para, reparsed_para)) in doc
+                .paragraphs
+                .iter()
+                .zip(reparsed.paragraphs.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    orig_para.spans.len(),
+                    reparsed_para.spans.len(),
+                    "[{}] Para {} span count mismatch: {} vs {}",
+                    name,
+                    pi,
+                    orig_para.spans.len(),
+                    reparsed_para.spans.len()
+                );
+
+                // Check each span's properties
+                for (si, (orig_span, reparsed_span)) in orig_para
+                    .spans
+                    .iter()
+                    .zip(reparsed_para.spans.iter())
+                    .enumerate()
+                {
+                    assert_eq!(
+                        orig_span.text, reparsed_span.text,
+                        "[{}] Para{} Span{} text mismatch: {:?} vs {:?}",
+                        name, pi, si, orig_span.text, reparsed_span.text
+                    );
+                    assert_eq!(
+                        orig_span.properties.color, reparsed_span.properties.color,
+                        "[{}] Para{} Span{} color mismatch",
+                        name, pi, si
+                    );
+                    assert_eq!(
+                        orig_span.properties.font, reparsed_span.properties.font,
+                        "[{}] Para{} Span{} font mismatch",
+                        name, pi, si
+                    );
+                    assert_eq!(
+                        orig_span.properties.height, reparsed_span.properties.height,
+                        "[{}] Para{} Span{} height mismatch",
+                        name, pi, si
+                    );
+                    assert_eq!(
+                        orig_span.properties.stroke, reparsed_span.properties.stroke,
+                        "[{}] Para{} Span{} stroke mismatch",
+                        name, pi, si
+                    );
+                }
+
+                // Check paragraph properties
+                assert_eq!(
+                    orig_para.properties.alignment, reparsed_para.properties.alignment,
+                    "[{}] Para{} alignment mismatch",
+                    name, pi
+                );
+                assert_eq!(
+                    orig_para.properties.first_line_indent,
+                    reparsed_para.properties.first_line_indent,
+                    "[{}] Para{} indent mismatch",
+                    name,
+                    pi
+                );
+                assert_eq!(
+                    orig_para.properties.left_margin, reparsed_para.properties.left_margin,
+                    "[{}] Para{} left_margin mismatch",
+                    name, pi
+                );
+            }
+        }
     }
 }

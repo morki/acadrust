@@ -621,11 +621,15 @@ impl MTextSpan {
         }
     }
 
-    /// Create a stacking span.
-    pub fn stacking(text: impl Into<String>, stacking: StackingData) -> Self {
+    /// Create a stacking span with the given properties.
+    pub fn stacking(
+        text: impl Into<String>,
+        properties: SpanProperties,
+        stacking: StackingData,
+    ) -> Self {
         MTextSpan {
             text: text.into(),
-            properties: SpanProperties::default(),
+            properties,
             stacking: Some(stacking),
         }
     }
@@ -674,8 +678,18 @@ impl MTextParagraph {
     }
 
     /// Get the plain text content of this paragraph (concatenating all spans).
+    /// For stacking spans, derives text from the stacking data.
     pub fn to_plain_text(&self) -> String {
-        self.spans.iter().map(|s| s.text.as_str()).collect()
+        self.spans
+            .iter()
+            .map(|s| {
+                if let Some(ref stack) = s.stacking {
+                    stack.to_plain_text()
+                } else {
+                    s.text.clone()
+                }
+            })
+            .collect()
     }
 
     /// Add a span to the end of the paragraph.
@@ -810,6 +824,11 @@ impl MTextDocument {
 
         let mut result = String::from("{");
 
+        // Track span properties across the whole document so control codes
+        // are only emitted when they change (not repeated per paragraph).
+        let mut current_props = SpanProperties::default();
+        let mut current_stacking: Option<StackingData> = None;
+
         for (pi, paragraph) in self.paragraphs.iter().enumerate() {
             if pi > 0 {
                 result.push_str("\\P");
@@ -867,8 +886,6 @@ impl MTextDocument {
                 result.push(';');
             }
 
-            let mut current_props = SpanProperties::default();
-
             for span in &paragraph.spans {
                 let mut needs_reset = false;
 
@@ -903,17 +920,37 @@ impl MTextDocument {
                 }
 
                 if needs_reset {
-                    Self::emit_properties(&mut result, &span.properties);
+                    Self::emit_properties(&mut result, &current_props, &span.properties);
                     current_props = span.properties.clone();
                 }
 
-                // Escape literal braces and backslashes in the text
-                for ch in span.text.chars() {
-                    match ch {
-                        '\\' => result.push_str("\\\\"),
-                        '{' => result.push_str("\\{"),
-                        '}' => result.push_str("\\}"),
-                        _ => result.push(ch),
+                // Emit stacking code when it changes
+                if span.stacking.as_ref() != current_stacking.as_ref() {
+                    if let Some(ref stack) = span.stacking {
+                        let sep = match stack.stacking_type {
+                            StackingType::Horizontal => '/',
+                            StackingType::Diagonal => '#',
+                            StackingType::Limit => '^',
+                        };
+                        write!(
+                            result,
+                            "\\S{}{}{};",
+                            stack.numerator, sep, stack.denominator
+                        )
+                        .ok();
+                    }
+                    current_stacking = span.stacking.clone();
+                }
+
+                // Emit text content (skip for stacking spans — the \S code IS the content)
+                if span.stacking.is_none() {
+                    for ch in span.text.chars() {
+                        match ch {
+                            '\\' => result.push_str("\\\\"),
+                            '{' => result.push_str("\\{"),
+                            '}' => result.push_str("\\}"),
+                            _ => result.push(ch),
+                        }
                     }
                 }
             }
@@ -923,22 +960,31 @@ impl MTextDocument {
         result
     }
 
-    fn emit_properties(result: &mut String, props: &SpanProperties) {
-        // Color (ACI)
-        if let Some(ref color) = props.color {
-            result.push_str("\\C");
-            match color {
-                MTextColor::Index(i) => {
-                    write!(result, "{};", i).ok();
-                }
-                MTextColor::TrueColor(v) => {
-                    write!(result, "{};", v).ok();
-                }
-                MTextColor::None => {
-                    result.push_str("0;");
+    fn emit_properties(
+        result: &mut String,
+        current_props: &SpanProperties,
+        props: &SpanProperties,
+    ) {
+        // Color (ACI) — only emit when changed
+        if props.color != current_props.color {
+            if let Some(ref color) = props.color {
+                result.push_str("\\C");
+                match color {
+                    MTextColor::Index(i) => {
+                        write!(result, "{};", i).ok();
+                    }
+                    MTextColor::TrueColor(v) => {
+                        write!(result, "{};", v).ok();
+                    }
+                    MTextColor::None => {
+                        result.push_str("0;");
+                    }
                 }
             }
-            // Second color
+        }
+
+        // Second color — only emit when changed
+        if props.second_color != current_props.second_color {
             if let Some(ref sc) = props.second_color {
                 match sc {
                     MTextColor::Index(i) => {
@@ -951,70 +997,94 @@ impl MTextDocument {
                         result.push(';');
                     }
                 }
+            }
+        }
+
+        // True-color RGB — only emit when changed
+        if props.color_rgb != current_props.color_rgb {
+            if let Some((r, g, b)) = props.color_rgb {
+                let packed: u32 = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+                write!(result, "\\c{};", packed).ok();
+            }
+        }
+
+        // Font — only emit when changed
+        if props.font.as_ref() != current_props.font.as_ref() {
+            if let Some(ref font) = props.font {
+                if !font.name.is_empty() {
+                    result.push_str("\\f");
+                    result.push_str(&font.name);
+                    if font.bold {
+                        result.push_str("|b1");
+                    }
+                    if font.italic {
+                        result.push_str("|i1");
+                    }
+                    if !font.style.is_empty() {
+                        result.push('|');
+                        result.push_str(&font.style);
+                    }
+                    result.push(';');
+                }
+            }
+        }
+
+        // Height — only emit when changed
+        if props.height != current_props.height {
+            if let Some(h) = props.height {
+                write!(result, "\\H{};", h).ok();
+            }
+        }
+
+        // Stroke decorations — emit ON/OFF codes when the state changes
+        if props.stroke.underline() != current_props.stroke.underline() {
+            if props.stroke.underline() {
+                result.push_str("\\L");
             } else {
-                result.push(';');
+                result.push_str("\\l");
+            }
+        }
+        if props.stroke.overline() != current_props.stroke.overline() {
+            if props.stroke.overline() {
+                result.push_str("\\O");
+            } else {
+                result.push_str("\\o");
+            }
+        }
+        if props.stroke.strikethrough() != current_props.stroke.strikethrough() {
+            if props.stroke.strikethrough() {
+                result.push_str("\\K");
+            } else {
+                result.push_str("\\k");
             }
         }
 
-        // True-color RGB
-        if let Some((r, g, b)) = props.color_rgb {
-            let packed: u32 = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
-            write!(result, "\\c{};", packed).ok();
-        }
-
-        // Font
-        if let Some(ref font) = props.font {
-            if !font.name.is_empty() {
-                result.push_str("\\f");
-                result.push_str(&font.name);
-                if font.bold {
-                    result.push_str("|b1");
-                }
-                if font.italic {
-                    result.push_str("|i1");
-                }
-                if !font.style.is_empty() {
-                    result.push('|');
-                    result.push_str(&font.style);
-                }
-                result.push(';');
+        // Line alignment — only emit when changed
+        if props.line_align != current_props.line_align {
+            if let Some(v) = props.line_align {
+                write!(result, "\\A{};", v as u8).ok();
             }
         }
 
-        // Height
-        if let Some(h) = props.height {
-            write!(result, "\\H{};", h).ok();
+        // Tracking — only emit when changed
+        if props.tracking != current_props.tracking {
+            if let Some(t) = props.tracking {
+                write!(result, "\\T{};", t).ok();
+            }
         }
 
-        // Stroke decorations
-        if props.stroke.underline() {
-            result.push_str("\\L");
-        }
-        if props.stroke.overline() {
-            result.push_str("\\O");
-        }
-        if props.stroke.strikethrough() {
-            result.push_str("\\K");
+        // Width factor — only emit when changed
+        if props.width_factor != current_props.width_factor {
+            if let Some(w) = props.width_factor {
+                write!(result, "\\W{};", w).ok();
+            }
         }
 
-        // Line alignment
-        if let Some(v) = props.line_align {
-            write!(result, "\\A{};", v as u8).ok();
-        }
-
-        // Tracking
-        if let Some(t) = props.tracking {
-            write!(result, "\\T{};", t).ok();
-        }
-
-        // Width factor
-        if let Some(w) = props.width_factor {
-            write!(result, "\\W{};", w).ok();
-        }
-
-        // Oblique angle
-        if let Some(a) = props.oblique_angle {
-            write!(result, "\\Q{};", a).ok();
+        // Oblique angle — only emit when changed
+        if props.oblique_angle != current_props.oblique_angle {
+            if let Some(a) = props.oblique_angle {
+                write!(result, "\\Q{};", a).ok();
+            }
         }
     }
 }
@@ -1195,7 +1265,7 @@ mod tests {
         let s = doc.to_mtext_string();
         assert!(s.starts_with("{"));
         assert!(s.ends_with("}"));
-        assert!(s.contains("\\C1;;"));
+        assert!(s.contains("\\C1;"));
     }
 
     #[test]
@@ -1213,5 +1283,96 @@ mod tests {
 
         let s = doc.to_mtext_string();
         assert!(s.contains("\\L"));
+    }
+
+    #[test]
+    fn test_serialize_no_duplicate_across_paragraphs() {
+        // When both paragraphs have the same color, only one \C1; is emitted
+        let mut doc = MTextDocument::new();
+        let mut props = SpanProperties::default();
+        props.color = Some(MTextColor::Index(1));
+
+        let mut para1 = MTextParagraph::new();
+        para1.push_span(MTextSpan::new("First", props.clone()));
+        doc.push_paragraph(para1);
+
+        let mut para2 = MTextParagraph::new();
+        para2.push_span(MTextSpan::new("Second", props));
+        doc.push_paragraph(para2);
+
+        let s = doc.to_mtext_string();
+        // Should be: {\C1;First\PSecond}  — color code NOT repeated
+        assert_eq!(s, "{\\C1;First\\PSecond}");
+    }
+
+    #[test]
+    fn test_serialize_color_change_between_paragraphs() {
+        let mut doc = MTextDocument::new();
+
+        let mut props1 = SpanProperties::default();
+        props1.color = Some(MTextColor::Index(1));
+        let mut para1 = MTextParagraph::new();
+        para1.push_span(MTextSpan::new("Red", props1));
+        doc.push_paragraph(para1);
+
+        let mut props2 = SpanProperties::default();
+        props2.color = Some(MTextColor::Index(5));
+        let mut para2 = MTextParagraph::new();
+        para2.push_span(MTextSpan::new("Blue", props2));
+        doc.push_paragraph(para2);
+
+        let s = doc.to_mtext_string();
+        // Both color codes must appear
+        assert!(s.contains("\\C1;"));
+        assert!(s.contains("\\C5;"));
+    }
+
+    #[test]
+    fn test_roundtrip_parse_serialize_color_across_paragraphs() {
+        // Parse → serialize → parse should produce the same structure
+        let input = "{\\C1;First\\PSecond}";
+        let doc = crate::entities::mtext_format::parse_mtext(input, false);
+
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            doc.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+
+        let serialized = doc.to_mtext_string();
+        // Exact roundtrip: input == output
+        assert_eq!(serialized, "{\\C1;First\\PSecond}");
+
+        let reparsed = crate::entities::mtext_format::parse_mtext(&serialized, false);
+
+        assert_eq!(reparsed.paragraphs.len(), 2);
+        assert_eq!(
+            reparsed.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(
+            reparsed.paragraphs[1].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_stable_no_growth() {
+        // Serializing and re-parsing should not create extra paragraphs
+        let input = "{\\C1;First\\PSecond\\PThird}";
+        let doc = crate::entities::mtext_format::parse_mtext(input, false);
+        assert_eq!(doc.paragraphs.len(), 3);
+
+        let s1 = doc.to_mtext_string();
+        let doc2 = crate::entities::mtext_format::parse_mtext(&s1, false);
+        assert_eq!(doc2.paragraphs.len(), 3);
+
+        let s2 = doc2.to_mtext_string();
+        // Should be identical (stable roundtrip)
+        assert_eq!(s1, s2);
     }
 }
