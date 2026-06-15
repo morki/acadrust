@@ -11,6 +11,8 @@ use super::types::*;
 
 /// Parse an MTEXT format string into a structured document.
 ///
+/// Recognizes all control codes whether or not the content is wrapped in
+/// `{...}`. Matches the behavior of AutoCAD MTEXT and MLEADER entities.
 /// # Arguments
 ///
 /// * `input` - The MTEXT format string to parse.
@@ -22,7 +24,23 @@ use super::types::*;
 /// An [`MTextDocument`] containing the parsed paragraphs and spans.
 pub fn parse_mtext(input: &str, merge_spans: bool) -> MTextDocument {
     let parser = MTextParser::new(input);
-    parser.parse(merge_spans)
+    parser.parse_formatted(merge_spans)
+}
+
+/// Parse a plain text string (e.g. TEXT entity) with minimal processing.
+///
+/// Only `%%` special characters and `\P` paragraph breaks are handled.
+/// All other characters — including backslash control codes like `\C`, `\H`,
+/// etc. — are treated as literal text. This matches the behavior of TEXT,
+/// ATTRIB, and ATTDEF entities.
+///
+/// # Returns
+///
+/// An [`MTextDocument`] containing the parsed paragraphs and spans.
+pub fn parse_plain_text(input: &str) -> MTextDocument {
+    let mut parser = MTextParser::new(input);
+    parser.parse_plain();
+    parser.document
 }
 
 /// Internal parser state with context stack support.
@@ -63,20 +81,77 @@ impl MTextParser {
         self.ctx_stack.last_mut().unwrap()
     }
 
-    fn parse(mut self, merge_spans: bool) -> MTextDocument {
-        // If input starts with `{`, parse as formatted mode.
-        // Otherwise parse as plain mode (still handle \P for paragraphs).
-        if !self.chars.is_empty() && self.chars[0] == '{' {
-            self.pos = 1;
-            self.push_ctx(); // push default context for the outer group
-            self.parse_formatted_mode(merge_spans);
-        } else {
-            self.parse_plain_mode();
+    /// Parse with full MTEXT formatting: all control codes are recognized
+    /// whether or not the content is wrapped in `{...}`.
+    fn parse_formatted(mut self, merge_spans: bool) -> MTextDocument {
+        if self.chars.is_empty() {
+            return self.document;
         }
 
+        // If content starts with `{`, treat it as an outer group.
+        // Otherwise, still parse control codes directly.
+        if self.chars[0] == '{' {
+            self.pos = 1;
+            self.push_ctx(); // push default context for the outer group
+        }
+        self.parse_formatted_mode(merge_spans);
         self.document
     }
 
+    /// Parse in plain mode: only `%%` special chars and `\P` paragraph breaks
+    /// are handled. All other characters (including `\C`, `\H`, etc.) are
+    /// treated as literal text.
+    ///
+    /// This matches the behavior of TEXT entities which do not support
+    /// backslash-based formatting codes.
+    fn parse_plain(&mut self) {
+        if self.chars.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        while self.pos < self.chars.len() {
+            // Handle %% special chars
+            if self.chars[self.pos] == '%'
+                && self.pos + 2 < self.chars.len()
+                && self.chars[self.pos + 1] == '%'
+            {
+                self.pos += 2;
+                let code = self.chars[self.pos].to_ascii_lowercase();
+                if let Some(special) = SpecialChar::from_char(code) {
+                    text.push(special.to_char());
+                    self.pos += 1;
+                    continue;
+                }
+                // Unknown %%? — pass through literally
+                text.push('%');
+                text.push('%');
+                continue;
+            }
+
+            // Handle \P paragraph breaks
+            if self.chars[self.pos] == '\\'
+                && self.pos + 1 < self.chars.len()
+                && (self.chars[self.pos + 1] == 'P' || self.chars[self.pos + 1] == 'p')
+            {
+                if !text.is_empty() {
+                    self.current_paragraph = MTextParagraph::from_text(&text);
+                    text.clear();
+                }
+                self.document
+                    .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                self.pos += 2;
+                continue;
+            }
+
+            text.push(self.chars[self.pos]);
+            self.pos += 1;
+        }
+        if !text.is_empty() {
+            self.current_paragraph = MTextParagraph::from_text(&text);
+        }
+        self.document
+            .push_paragraph(std::mem::take(&mut self.current_paragraph));
+    }
     /// Push a copy of the current context onto the stack.
     fn push_ctx(&mut self) {
         if let Some(props) = self.ctx_stack.last() {
@@ -89,36 +164,6 @@ impl MTextParser {
         if self.ctx_stack.len() > 1 {
             self.ctx_stack.pop();
         }
-    }
-
-    /// Parse in plain mode (no `{...}` wrapping). Still handle `\P` for paragraphs.
-    fn parse_plain_mode(&mut self) {
-        if self.pos >= self.chars.len() {
-            return;
-        }
-        let mut text = String::new();
-        while self.pos < self.chars.len() {
-            if self.chars[self.pos] == '\\' && self.pos + 1 < self.chars.len() {
-                let next = self.chars[self.pos + 1];
-                if next == 'P' || next == 'p' {
-                    if !text.is_empty() {
-                        self.current_paragraph = MTextParagraph::from_text(&text);
-                        text.clear();
-                    }
-                    self.document
-                        .push_paragraph(std::mem::take(&mut self.current_paragraph));
-                    self.pos += 2;
-                    continue;
-                }
-            }
-            text.push(self.chars[self.pos]);
-            self.pos += 1;
-        }
-        if !text.is_empty() {
-            self.current_paragraph = MTextParagraph::from_text(&text);
-        }
-        self.document
-            .push_paragraph(std::mem::take(&mut self.current_paragraph));
     }
 
     /// Parse in formatted mode (inside `{...}`).
@@ -1539,10 +1584,22 @@ mod tests {
 
     #[test]
     fn test_parse_many_paragraphs() {
-        // 20 paragraphs + trailing \P creates 21 (last empty)
-        let input: String = (0..20).map(|i| format!("Para{}\\P", i)).collect();
+        // 20 paragraphs, each ending with \P
+        let input: String = format!(
+            "{{{}}}",
+            (0..20).map(|i| format!("Para{}\\P", i)).collect::<String>()
+        );
         let doc = parse_mtext(&input, false);
-        assert_eq!(doc.paragraphs.len(), 21);
+        assert_eq!(doc.paragraphs.len(), 20);
+    }
+
+    #[test]
+    fn test_parse_trailing_paragraph_break() {
+        // Trailing \P creates paragraphs for the non-empty content
+        let doc = parse_mtext("{Line1\\PLine2\\P}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Line1");
+        assert_eq!(doc.paragraphs[1].to_plain_text(), "Line2");
     }
 
     #[test]
@@ -1620,14 +1677,14 @@ mod tests {
 
     #[test]
     fn test_parse_with_merge_spans() {
-        let doc = parse_mtext(r"({\C1;Red more})", false);
+        let doc = parse_mtext(r"{\C1;Red more}", true);
         assert_eq!(doc.paragraphs[0].spans.len(), 1);
     }
 
     #[test]
     fn test_parse_without_merge_spans() {
-        let doc = parse_mtext(r"({\C1;Red more})", true);
-        // merge_spans=true should merge adjacent same-style text
+        let doc = parse_mtext(r"{\C1;Red more}", false);
+        // merge_spans=false still creates one span because there's no preceding text
         assert_eq!(doc.paragraphs[0].spans.len(), 1);
     }
 
@@ -1644,8 +1701,64 @@ mod tests {
 
     #[test]
     fn test_roundtrip_escaped_chars() {
+        // {\\} in MTEXT → one literal backslash
         let doc = parse_mtext("{\\\\}", false);
-        let s = doc.to_mtext_string();
-        assert!(s.contains("\\"));
+        let plain = doc.to_plain_text();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain.chars().next(), Some('\\'));
+    }
+
+    // ========================================================================
+    // Plain text parsing (TEXT entities)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_plain_special_chars() {
+        let doc = parse_plain_text("%%c%%d%%p");
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Ø°±");
+    }
+
+    #[test]
+    fn test_parse_plain_control_codes_literal() {
+        // TEXT entities don't support backslash control codes
+        let doc = parse_plain_text("\\C1;Red");
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "\\C1;Red");
+    }
+
+    #[test]
+    fn test_parse_plain_paragraph_break() {
+        let doc = parse_plain_text("Line1\\PLine2");
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Line1");
+        assert_eq!(doc.paragraphs[1].to_plain_text(), "Line2");
+    }
+
+    #[test]
+    fn test_parse_plain_no_brace_grouping() {
+        // Braces are literal text in plain mode
+        let doc = parse_plain_text("{text}");
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "{text}");
+    }
+
+    #[test]
+    fn test_parse_mtext_unbraced_control_codes() {
+        // MTEXT parser handles control codes even without braces
+        let doc = parse_mtext("\\C1;Red\\C0;; normal", false);
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Red normal");
+    }
+
+    #[test]
+    fn test_parse_mtext_unbraced_paragraphs() {
+        let doc = parse_mtext("Line1\\PLine2", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mtext_unbraced_font() {
+        let doc = parse_mtext("\\fArial;Hello", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Hello");
+        assert!(doc.paragraphs[0].spans[0].properties.font.is_some());
     }
 }
