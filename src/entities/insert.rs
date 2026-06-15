@@ -678,7 +678,7 @@ mod tests {
         Block, BlockEnd, Circle, Line,
         AttributeDefinition,
     };
-    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     /// Helper – approximate equality for f64
     fn approx(a: f64, b: f64) -> bool {
@@ -1388,6 +1388,86 @@ mod tests {
             assert!(approx_vec(end, Vector3::new(0.0, 1.0, 0.0)));
         } else {
             panic!("expected Ellipse for non-uniform mirrored scale");
+        }
+    }
+
+    // ── text rotation ───────────────────────────────────────────
+
+    #[test]
+    fn explode_text_with_rotation_updates_text_rotation() {
+        use crate::entities::Text;
+
+        let text = Text::with_value("Hello", Vector3::ZERO)
+            .with_height(2.0)
+            .with_rotation(0.0);
+        let block_entities = vec![EntityType::Text(text)];
+
+        let insert = Insert::new("B", Vector3::ZERO).with_rotation(FRAC_PI_2);
+        let result = insert.explode(&block_entities);
+
+        assert_eq!(result.len(), 1);
+        if let EntityType::Text(t) = &result[0] {
+            assert!(
+                (t.rotation - FRAC_PI_2).abs() < 1e-10,
+                "expected rotation ~{}, got {}",
+                FRAC_PI_2,
+                t.rotation
+            );
+        } else {
+            panic!("expected Text");
+        }
+    }
+
+    #[test]
+    fn explode_text_combined_rotations() {
+        use crate::entities::Text;
+
+        let text = Text::with_value("Hello", Vector3::ZERO)
+            .with_height(2.0)
+            .with_rotation(FRAC_PI_4);
+        let block_entities = vec![EntityType::Text(text)];
+
+        let insert = Insert::new("B", Vector3::ZERO).with_rotation(FRAC_PI_2);
+        let result = insert.explode(&block_entities);
+
+        assert_eq!(result.len(), 1);
+        if let EntityType::Text(t) = &result[0] {
+            let expected = FRAC_PI_4 + FRAC_PI_2;
+            assert!(
+                (t.rotation - expected).abs() < 1e-10,
+                "expected rotation ~{}, got {}",
+                expected,
+                t.rotation
+            );
+        } else {
+            panic!("expected Text");
+        }
+    }
+
+    #[test]
+    fn explode_mtext_with_rotation_updates_rotation() {
+        use crate::entities::MText;
+
+        let mtext = MText {
+            insertion_point: Vector3::ZERO,
+            rotation: 0.0,
+            ..MText::new()
+        };
+        let block_entities = vec![EntityType::MText(mtext)];
+
+        let insert = Insert::new("B", Vector3::ZERO).with_rotation(FRAC_PI_2);
+        let result = insert.explode(&block_entities);
+
+        assert_eq!(result.len(), 1);
+        if let EntityType::MText(t) = &result[0] {
+            assert!(
+                (t.rotation - FRAC_PI_2).abs() < 1e-10,
+                "expected rotation ~{}, got {}",
+                FRAC_PI_2,
+                t.rotation
+            );
+        } else {
+            panic!("expected MText");
         }
     }
 }

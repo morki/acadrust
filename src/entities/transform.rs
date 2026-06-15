@@ -134,7 +134,10 @@ pub(crate) fn transform_text(e: &mut Text, transform: &Transform) {
     let transformed_unit = transform.apply_rotation(unit_x);
     let scale_factor = transformed_unit.length();
     e.height *= scale_factor;
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 }
 
 // ── MText ────────────────────────────────────────────────────────────────────
@@ -149,7 +152,10 @@ pub(crate) fn transform_mtext(e: &mut MText, transform: &Transform) {
     if let Some(ref mut h) = e.rectangle_height {
         *h *= scale_factor;
     }
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 }
 
 // ── Spline ───────────────────────────────────────────────────────────────────
@@ -497,6 +503,38 @@ pub(crate) fn transform_normal(transform: &Transform, normal: Vector3) -> Vector
     }
 }
 
+/// Compute the new 2D rotation angle for an entity after a transform.
+///
+/// The entity's rotation is defined relative to its own OCS. This function
+/// transforms the rotation direction through the OCS->WCS->OCS chain:
+/// 1. Convert the entity's rotation direction from its old OCS to WCS.
+/// 2. Apply the transform's rotation to that direction.
+/// 3. Convert the result back into the entity's new OCS.
+///
+/// `old_normal` - the entity's normal before the transform.
+/// `new_normal` - the entity's normal after the transform (e.g. from `transform_normal`).
+/// `old_rotation` - the entity's rotation angle before the transform.
+/// `transform` - the transform being applied.
+pub(crate) fn transform_rotation(
+    old_normal: Vector3,
+    new_normal: Vector3,
+    old_rotation: f64,
+    transform: &Transform,
+) -> f64 {
+    let trans_ow = Matrix3::arbitrary_axis(old_normal) * Matrix3::rotation_z(old_rotation);
+    let trans_wo = Matrix3::arbitrary_axis(new_normal).transpose();
+
+    let m4 = transform.matrix;
+    let transformation = Matrix3::from_rows(
+        [m4.m[0][0], m4.m[0][1], m4.m[0][2]],
+        [m4.m[1][0], m4.m[1][1], m4.m[1][2]],
+        [m4.m[2][0], m4.m[2][1], m4.m[2][2]],
+    );
+
+    let v = trans_wo * (transformation * (trans_ow * Vector3::UNIT_X));
+    v.y.atan2(v.x)
+}
+
 pub(crate) fn transform_insert(e: &mut Insert, transform: &Transform) {
     let new_position = transform.apply(e.insert_point);
     let new_normal = transform_normal(transform, e.normal);
@@ -595,7 +633,10 @@ pub(crate) fn transform_attribute_definition(
 ) {
     e.insertion_point = transform.apply(e.insertion_point);
     e.alignment_point = transform.apply(e.alignment_point);
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 
     let unit_x = Vector3::new(1.0, 0.0, 0.0);
     let transformed_unit = transform.apply_rotation(unit_x);
@@ -608,7 +649,10 @@ pub(crate) fn transform_attribute_definition(
 pub(crate) fn transform_attribute_entity(e: &mut AttributeEntity, transform: &Transform) {
     e.insertion_point = transform.apply(e.insertion_point);
     e.alignment_point = transform.apply(e.alignment_point);
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 
     let unit_x = Vector3::new(1.0, 0.0, 0.0);
     let transformed_unit = transform.apply_rotation(unit_x);
@@ -811,14 +855,20 @@ pub(crate) fn transform_shape(e: &mut Shape, transform: &Transform) {
     let transformed_unit = transform.apply_rotation(unit_x);
     let scale_factor = transformed_unit.length();
     e.size *= scale_factor;
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 }
 
 // ── Underlay ─────────────────────────────────────────────────────────────────
 
 pub(crate) fn transform_underlay(e: &mut Underlay, transform: &Transform) {
     e.insertion_point = transform.apply(e.insertion_point);
-    e.normal = transform.apply_rotation(e.normal).normalize();
+
+    let old_normal = e.normal;
+    e.normal = transform_normal(transform, e.normal);
+    e.rotation = transform_rotation(old_normal, e.normal, e.rotation, transform);
 
     let unit_x = Vector3::new(1.0, 0.0, 0.0);
     let transformed_unit = transform.apply_rotation(unit_x);
