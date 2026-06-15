@@ -1,0 +1,1651 @@
+//! MTEXT format string parser.
+//!
+//! Parses AutoCAD MTEXT formatted strings into structured [`MTextDocument`]
+//! containing paragraphs and styled spans.
+//!
+//! For the full specification of supported control codes, see the [`mtext_format`] module.
+//!
+//! [`mtext_format`]: crate::entities::mtext_format
+
+use super::types::*;
+
+/// Parse an MTEXT format string into a structured document.
+///
+/// # Arguments
+///
+/// * `input` - The MTEXT format string to parse.
+/// * `merge_spans` - If `true`, consecutive spans with identical properties
+///   are merged into a single span.
+///
+/// # Returns
+///
+/// An [`MTextDocument`] containing the parsed paragraphs and spans.
+pub fn parse_mtext(input: &str, merge_spans: bool) -> MTextDocument {
+    let parser = MTextParser::new(input);
+    parser.parse(merge_spans)
+}
+
+/// Internal parser state with context stack support.
+struct MTextParser {
+    /// Input characters as a vector for indexed access.
+    chars: Vec<char>,
+    /// Current position in the character vector.
+    pos: usize,
+    /// Stack of style contexts. `{` pushes, `}` pops.
+    ctx_stack: Vec<SpanProperties>,
+    /// Text buffer for the current span.
+    text_buf: String,
+    /// Output document.
+    document: MTextDocument,
+    /// Current paragraph.
+    current_paragraph: MTextParagraph,
+}
+
+impl MTextParser {
+    fn new(input: &str) -> Self {
+        MTextParser {
+            chars: input.chars().collect(),
+            pos: 0,
+            ctx_stack: vec![SpanProperties::default()],
+            text_buf: String::new(),
+            document: MTextDocument::new(),
+            current_paragraph: MTextParagraph::new(),
+        }
+    }
+
+    /// Current active properties (top of stack).
+    fn current_props(&self) -> &SpanProperties {
+        self.ctx_stack.last().unwrap()
+    }
+
+    /// Mutable current active properties.
+    fn current_props_mut(&mut self) -> &mut SpanProperties {
+        self.ctx_stack.last_mut().unwrap()
+    }
+
+    fn parse(mut self, merge_spans: bool) -> MTextDocument {
+        // If input starts with `{`, parse as formatted mode.
+        // Otherwise parse as plain mode (still handle \P for paragraphs).
+        if !self.chars.is_empty() && self.chars[0] == '{' {
+            self.pos = 1;
+            self.push_ctx(); // push default context for the outer group
+            self.parse_formatted_mode(merge_spans);
+        } else {
+            self.parse_plain_mode();
+        }
+
+        self.document
+    }
+
+    /// Push a copy of the current context onto the stack.
+    fn push_ctx(&mut self) {
+        if let Some(props) = self.ctx_stack.last() {
+            self.ctx_stack.push(props.clone());
+        }
+    }
+
+    /// Pop the current context, restoring the previous one.
+    fn pop_ctx(&mut self) {
+        if self.ctx_stack.len() > 1 {
+            self.ctx_stack.pop();
+        }
+    }
+
+    /// Parse in plain mode (no `{...}` wrapping). Still handle `\P` for paragraphs.
+    fn parse_plain_mode(&mut self) {
+        if self.pos >= self.chars.len() {
+            return;
+        }
+        let mut text = String::new();
+        while self.pos < self.chars.len() {
+            if self.chars[self.pos] == '\\' && self.pos + 1 < self.chars.len() {
+                let next = self.chars[self.pos + 1];
+                if next == 'P' || next == 'p' {
+                    if !text.is_empty() {
+                        self.current_paragraph = MTextParagraph::from_text(&text);
+                        text.clear();
+                    }
+                    self.document
+                        .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                    self.pos += 2;
+                    continue;
+                }
+            }
+            text.push(self.chars[self.pos]);
+            self.pos += 1;
+        }
+        if !text.is_empty() {
+            self.current_paragraph = MTextParagraph::from_text(&text);
+        }
+        self.document
+            .push_paragraph(std::mem::take(&mut self.current_paragraph));
+    }
+
+    /// Parse in formatted mode (inside `{...}`).
+    fn parse_formatted_mode(&mut self, merge_spans: bool) {
+        while self.pos < self.chars.len() {
+            let ch = self.chars[self.pos];
+
+            match ch {
+                '\\' => {
+                    self.flush_current_span(merge_spans);
+                    self.parse_control_code();
+                }
+                '{' => {
+                    // Push new context (inherit from current)
+                    self.push_ctx();
+                    self.pos += 1;
+                }
+                '}' => {
+                    // Pop context — this is a span boundary
+                    self.flush_current_span(merge_spans);
+                    self.pop_ctx();
+                    // After popping, flush again so that text following
+                    // a group uses the restored (different) style.
+                    if !self.text_buf.is_empty() {
+                        self.flush_current_span(merge_spans);
+                    }
+                    self.pos += 1;
+                }
+                '%' => {
+                    self.handle_special_char();
+                }
+                _ => {
+                    self.text_buf.push(ch);
+                    self.pos += 1;
+                }
+            }
+        }
+
+        // End of input — flush remaining
+        self.flush_current_span(merge_spans);
+        if !self.current_paragraph.is_empty() {
+            self.document
+                .push_paragraph(std::mem::take(&mut self.current_paragraph));
+        }
+    }
+
+    /// Handle `%%` special character codes.
+    fn handle_special_char(&mut self) {
+        if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '%' {
+            self.pos += 2; // skip "%%"
+
+            if self.pos < self.chars.len() {
+                // %%%% → literal %
+                if self.chars[self.pos] == '%'
+                    && self.pos + 1 < self.chars.len()
+                    && self.chars[self.pos + 1] == '%'
+                {
+                    self.pos += 2;
+                    self.text_buf.push('%');
+                    return;
+                }
+
+                let code_char = self.chars[self.pos];
+
+                if let Some(special) = SpecialChar::from_char(code_char) {
+                    self.pos += 1;
+                    match special {
+                        SpecialChar::Percent => {
+                            self.text_buf.push('%');
+                        }
+                        SpecialChar::Degree | SpecialChar::PlusMinus | SpecialChar::Diameter => {
+                            self.text_buf.push(special.to_char());
+                        }
+                    }
+                } else {
+                    // Unknown %% code — emit literally and advance past the code char
+                    self.text_buf.push('%');
+                    self.text_buf.push('%');
+                    self.text_buf.push(code_char);
+                    self.pos += 1;
+                }
+            }
+        } else {
+            // Not a %% code, just a regular '%' character
+            self.text_buf.push('%');
+            self.pos += 1;
+        }
+    }
+
+    /// Flush the current text buffer as a span with current properties.
+    fn flush_current_span(&mut self, merge_spans: bool) {
+        if self.text_buf.is_empty() {
+            return;
+        }
+
+        let props = self.current_props().clone();
+        let span = MTextSpan::new(self.text_buf.clone(), props);
+        self.text_buf.clear();
+
+        if merge_spans {
+            self.current_paragraph.push_span_merged(span);
+        } else {
+            self.current_paragraph.push_span(span);
+        }
+    }
+
+    /// Parse a control code starting at self.pos (which is the `\`).
+    fn parse_control_code(&mut self) {
+        if self.pos >= self.chars.len() {
+            return;
+        }
+        self.pos += 1; // skip '\'
+
+        if self.pos >= self.chars.len() {
+            self.text_buf.push('\\');
+            return;
+        }
+
+        let code = self.chars[self.pos];
+
+        match code {
+            // Escaped characters
+            '\\' => {
+                self.text_buf.push('\\');
+                self.pos += 1;
+            }
+            '{' => {
+                self.text_buf.push('{');
+                self.pos += 1;
+            }
+            '}' => {
+                self.text_buf.push('}');
+                self.pos += 1;
+            }
+
+            // Non-breaking space
+            '~' => {
+                self.text_buf.push('\u{00A0}');
+                self.pos += 1;
+            }
+
+            // Unicode escape: \U+XXXX
+            'U' if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '+' => {
+                self.pos += 2; // skip \U+
+                let start = self.pos;
+                while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_hexdigit() {
+                    self.pos += 1;
+                }
+                let hex: String = self.chars[start..self.pos].iter().collect();
+                if let Ok(code_point) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(code_point) {
+                        self.text_buf.push(ch);
+                    }
+                }
+            }
+
+            // Paragraph break: \P (uppercase) is always a paragraph break.
+            // \p followed by content is paragraph properties; \p alone is a paragraph break.
+            'P' => {
+                self.pos += 1;
+                self.flush_current_span(false);
+                self.document
+                    .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                // Reset properties for the new paragraph
+                self.current_props_mut()
+                    .clone_from(&SpanProperties::default());
+            }
+
+            // \p...; → paragraph properties, or \p alone → paragraph break
+            'p' => {
+                self.pos += 1;
+                self.parse_paragraph_properties();
+            }
+
+            // New column break
+            'N' => {
+                self.pos += 1;
+                self.flush_current_span(false);
+                self.document
+                    .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                self.current_props_mut()
+                    .clone_from(&SpanProperties::default());
+            }
+
+            // Wrap at dimension line (skip, no output)
+            'X' => {
+                self.pos += 1;
+            }
+
+            // ── Stroke decorations ──
+
+            // Underline on
+            'L' => {
+                self.pos += 1;
+                self.current_props_mut().set_underline(true);
+            }
+
+            // Underline off
+            'l' => {
+                self.pos += 1;
+                self.current_props_mut().set_underline(false);
+            }
+
+            // Overline on
+            'O' => {
+                self.pos += 1;
+                self.current_props_mut().set_overline(true);
+            }
+
+            // Overline off
+            'o' => {
+                self.pos += 1;
+                self.current_props_mut().set_overline(false);
+            }
+
+            // Strikethrough on
+            'K' => {
+                self.pos += 1;
+                self.current_props_mut().set_strikethrough(true);
+            }
+
+            // Strikethrough off
+            'k' => {
+                self.pos += 1;
+                self.current_props_mut().set_strikethrough(false);
+            }
+
+            // ── Color codes ──
+
+            // ACI color: \C{start};{end};
+            'C' => {
+                self.pos += 1;
+                self.parse_aci_color();
+            }
+
+            // True-color RGB: \c{bgr_packed};
+            'c' => {
+                self.pos += 1;
+                self.parse_rgb_color();
+            }
+
+            // ── Font codes ──
+
+            // Font with pipe flags: \f{name}|b0/b1|i0/i1|...;
+            'f' => {
+                self.pos += 1;
+                self.parse_font_pipe();
+            }
+
+            // \F{font}; — Font selection (alias for \f, supports pipe flags too).
+            // \FN{name}.shx; — Font by SHX name.
+            'F' => {
+                self.pos += 1;
+                if self.pos < self.chars.len() && self.chars[self.pos] == 'N' {
+                    self.pos += 1;
+                    self.parse_font_shx();
+                } else {
+                    // \F can also be used like \f with pipe-separated flags
+                    self.parse_font_pipe();
+                }
+            }
+
+            // ── Height ──
+
+            // Height: \H{value}; (absolute) or \H{value}x; (relative)
+            'H' => {
+                self.pos += 1;
+                self.parse_height_code();
+            }
+
+            // ── Width ──
+
+            // Width factor: \W{value}; (absolute) or \W{value}x; (relative)
+            'W' | 'w' => {
+                self.pos += 1;
+                self.parse_width_code();
+            }
+
+            // ── Tracking ──
+
+            // Tracking: \T{value}; (absolute) or \T{value}x; (relative)
+            'T' => {
+                self.pos += 1;
+                self.parse_tracking_code();
+            }
+
+            // ── Oblique ──
+
+            // Oblique angle: \Q{angle};
+            'Q' => {
+                self.pos += 1;
+                self.parse_oblique_code();
+            }
+
+            // ── Line alignment ──
+
+            // Line alignment: \A{code};
+            'A' => {
+                self.pos += 1;
+                self.parse_alignment_code();
+            }
+
+            // ── Stacking ──
+
+            // Stacking: \S{numerator}/{denominator};
+            'S' | 's' => {
+                self.pos += 1;
+                self.parse_stacking_code();
+            }
+
+            // ── Legacy strikethrough ──
+
+            // Legacy strikethrough: \b{n};
+            'b' => {
+                self.pos += 1;
+                self.parse_legacy_strikethrough();
+            }
+
+            // ── Tab stop (skip) ──
+            't' => {
+                self.pos += 1;
+                self.skip_semicolon_value();
+            }
+
+            // ── Background mask (skip) ──
+            'B' => {
+                self.pos += 1;
+                self.skip_semicolon_value();
+            }
+
+            // Unknown control code — emit literally
+            _ => {
+                self.text_buf.push('\\');
+                self.text_buf.push(code);
+                self.pos += 1;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Individual code parsers
+    // ========================================================================
+
+    /// Parse ACI color: \C{color1};{color2};
+    fn parse_aci_color(&mut self) {
+        self.current_props_mut().color = None;
+        self.current_props_mut().second_color = None;
+        self.current_props_mut().color_rgb = None;
+
+        // Read color1
+        if let Some(c1) = self.parse_numeric_semicolon_value() {
+            if c1 != 0 && c1 != 256 {
+                self.current_props_mut().color = Some(MTextColor::from_index(c1));
+            }
+
+            // Read color2 (ending color for gradient)
+            if let Some(c2) = self.parse_numeric_semicolon_value() {
+                if c2 != 0 && c2 != 256 {
+                    self.current_props_mut().second_color = Some(MTextColor::from_index(c2));
+                }
+            }
+        }
+    }
+
+    /// Parse true-color RGB: \c{packed_bgr};
+    fn parse_rgb_color(&mut self) {
+        let value_str = self.parse_semicolon_value();
+        if let Ok(packed) = value_str.trim().parse::<u32>() {
+            let b_val = (packed & 0xFF) as u8;
+            let g_val = ((packed >> 8) & 0xFF) as u8;
+            let r_val = ((packed >> 16) & 0xFF) as u8;
+            self.current_props_mut().color_rgb = Some((r_val, g_val, b_val));
+            self.current_props_mut().color = None; // RGB overrides ACI
+        }
+    }
+
+    /// Parse font with pipe flags: \f{name}|b0/b1|i0/i1|...;
+    fn parse_font_pipe(&mut self) {
+        let spec = self.parse_semicolon_value();
+        let parts: Vec<&str> = spec.split([',', '|']).collect();
+
+        let name = parts.first().map(|s| s.trim()).unwrap_or("");
+        if name.is_empty() {
+            return;
+        }
+
+        let mut bold = false;
+        let mut italic = false;
+
+        for part in parts.iter().skip(1) {
+            let part = part.trim();
+            if part == "b1" {
+                bold = true;
+            } else if part == "i1" {
+                // Only single char 'i' + digit is italic
+                if part.len() == 2
+                    && part
+                        .as_bytes()
+                        .get(1)
+                        .map_or(false, |&b| b.is_ascii_digit())
+                {
+                    italic = true;
+                }
+            }
+        }
+
+        self.current_props_mut().font = Some(MTextFont::with_flags(name, bold, italic));
+    }
+
+    /// Parse font by SHX name: \FN{name}.shx;
+    fn parse_font_shx(&mut self) {
+        let name = self.parse_semicolon_value();
+        if !name.trim().is_empty() {
+            self.current_props_mut().font = Some(MTextFont::from_name(name.trim()));
+        }
+    }
+
+    /// Parse height: \H{value}; (absolute) or \H{value}x; (relative)
+    fn parse_height_code(&mut self) {
+        let value_str = self.parse_semicolon_value_or_x();
+        let is_relative = value_str.ends_with('x') || value_str.ends_with('X');
+        let num_str = if is_relative {
+            &value_str[..value_str.len() - 1]
+        } else {
+            &value_str
+        };
+
+        if let Ok(f) = num_str.trim().parse::<f64>() {
+            if is_relative {
+                let cur = self.current_props().height.unwrap_or(1.0);
+                self.current_props_mut().height = Some(cur * f.abs());
+            } else {
+                self.current_props_mut().height = Some(f.abs());
+            }
+        }
+    }
+
+    /// Parse width factor: \W{value}; (absolute) or \W{value}x; (relative)
+    fn parse_width_code(&mut self) {
+        let value_str = self.parse_semicolon_value_or_x();
+        let is_relative = value_str.ends_with('x') || value_str.ends_with('X');
+        let num_str = if is_relative {
+            &value_str[..value_str.len() - 1]
+        } else {
+            &value_str
+        };
+
+        if let Ok(f) = num_str.trim().parse::<f64>() {
+            if is_relative {
+                let cur = self.current_props().width_factor.unwrap_or(1.0);
+                self.current_props_mut().width_factor = Some(cur * f.abs());
+            } else {
+                self.current_props_mut().width_factor = Some(f.abs());
+            }
+        }
+    }
+
+    /// Parse tracking: \T{value}; (absolute) or \T{value}x; (relative)
+    fn parse_tracking_code(&mut self) {
+        let value_str = self.parse_semicolon_value_or_x();
+        let is_relative = value_str.ends_with('x') || value_str.ends_with('X');
+        let num_str = if is_relative {
+            &value_str[..value_str.len() - 1]
+        } else {
+            &value_str
+        };
+
+        if let Ok(f) = num_str.trim().parse::<f64>() {
+            if is_relative {
+                let cur = self.current_props().tracking.unwrap_or(1.0);
+                self.current_props_mut().tracking = Some(cur * f.abs());
+            } else {
+                self.current_props_mut().tracking = Some(f);
+            }
+        }
+    }
+
+    /// Parse oblique angle: \Q{angle};
+    fn parse_oblique_code(&mut self) {
+        let value_str = self.parse_semicolon_value();
+        if let Ok(f) = value_str.trim().parse::<f64>() {
+            self.current_props_mut().oblique_angle = Some(f);
+        }
+    }
+
+    /// Parse line alignment: \A{code};
+    fn parse_alignment_code(&mut self) {
+        let value_str = self.parse_semicolon_value();
+        let code: u8 = value_str.parse().unwrap_or(0);
+        self.current_props_mut().line_align = Some(MTextLineAlignment::from_code(code));
+    }
+
+    /// Parse stacking: \S{numerator}/{denominator};
+    /// Separators: / (horizontal), # (diagonal), ^ (limit)
+    fn parse_stacking_code(&mut self) {
+        let expr = self.parse_semicolon_value();
+
+        // Find separator
+        let mut numerator = String::new();
+        let mut denominator = String::new();
+        let mut stacking_type = StackingType::Horizontal;
+
+        let chars: Vec<char> = expr.chars().collect();
+        let mut i = 0;
+        let mut found_sep = false;
+
+        while i < chars.len() {
+            let ch = chars[i];
+            if !found_sep && matches!(ch, '/' | '#' | '^') {
+                found_sep = true;
+                stacking_type = StackingType::from_char(ch);
+                if ch == '^' && i + 1 < chars.len() && chars[i + 1] == ' ' {
+                    i += 1; // ^ may be followed by space
+                }
+            } else if found_sep {
+                denominator.push(ch);
+            } else {
+                numerator.push(ch);
+            }
+            i += 1;
+        }
+
+        // For stacking, we emit the text inline with a slash
+        let plain = match stacking_type {
+            StackingType::Horizontal => format!("{}/{}", numerator, denominator),
+            StackingType::Diagonal => format!("{}/{}", numerator, denominator),
+            StackingType::Limit => format!("{} {}", numerator, denominator),
+        };
+
+        let stacking = StackingData {
+            numerator,
+            denominator,
+            stacking_type,
+        };
+
+        let span = MTextSpan::stacking(plain, stacking);
+        self.current_paragraph.push_span(span);
+    }
+
+    /// Parse paragraph properties: \p...q<c/l/r/j/d>...;
+    /// If the value is empty (no semicolon content), treat as paragraph break.
+    fn parse_paragraph_properties(&mut self) {
+        // Peek ahead to see if this looks like paragraph properties
+        // If the next non-whitespace char is ';' or end of string, it's just a paragraph break
+        let start_pos = self.pos;
+        let expr = self.parse_semicolon_value();
+
+        // If expr is empty or only whitespace, treat as paragraph break
+        if expr.trim().is_empty() {
+            self.pos = start_pos;
+            self.flush_current_span(false);
+            self.document
+                .push_paragraph(std::mem::take(&mut self.current_paragraph));
+            self.current_props_mut()
+                .clone_from(&SpanProperties::default());
+            return;
+        }
+        let chars: Vec<char> = expr.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == 'q' && i + 1 < chars.len() {
+                let align = MTextParagraphAlignment::from_char(chars[i + 1]);
+                self.current_paragraph.properties.alignment = Some(align);
+                i += 2;
+            } else if ch == 'i' && i + 1 < chars.len() {
+                // First-line indent
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                {
+                    k += 1;
+                }
+                if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                    self.current_paragraph.properties.first_line_indent = Some(v);
+                }
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else if ch == 'l' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                // Left margin (only if followed by digit to distinguish from \l underline)
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                {
+                    k += 1;
+                }
+                if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                    self.current_paragraph.properties.left_margin = Some(v);
+                }
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else if ch == 'r' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                // Right margin
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                {
+                    k += 1;
+                }
+                if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                    self.current_paragraph.properties.right_margin = Some(v);
+                }
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else if ch == 'b' && i + 1 < chars.len() {
+                // Spacing before paragraph
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                {
+                    k += 1;
+                }
+                if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                    self.current_paragraph.properties.spacing_before = Some(v);
+                }
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else if ch == 'a' && i + 1 < chars.len() {
+                // Spacing after paragraph
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                {
+                    k += 1;
+                }
+                if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                    self.current_paragraph.properties.spacing_after = Some(v);
+                }
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else if ch == 's' && i + 1 < chars.len() {
+                // Line spacing: se<n> (exact) or sm<n> (multiple)
+                let sub = chars[i + 1];
+                if sub == 'e' || sub == 'm' {
+                    let start = i + 2;
+                    let mut k = start;
+                    while k < chars.len()
+                        && (chars[k].is_ascii_digit() || chars[k] == '.' || chars[k] == '-')
+                    {
+                        k += 1;
+                    }
+                    if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
+                        self.current_paragraph.properties.line_spacing = if sub == 'e' {
+                            Some(MTextLineSpacing::Exact(v))
+                        } else {
+                            Some(MTextLineSpacing::Multiple(v))
+                        };
+                    }
+                    i = k;
+                    if i < chars.len() && chars[i] == ',' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            } else if ch == 't' && i + 1 < chars.len() {
+                // Tab stops: comma-separated positions
+                let start = i + 1;
+                let mut k = start;
+                while k < chars.len()
+                    && (chars[k].is_ascii_digit()
+                        || chars[k] == '.'
+                        || chars[k] == '-'
+                        || chars[k] == ',')
+                {
+                    k += 1;
+                }
+                let segment: String = chars[start..k].iter().collect();
+                let mut tab_stops: Vec<f64> = self.current_paragraph.properties.tab_stops.clone();
+                for part in segment.split(',') {
+                    if let Ok(v) = part.trim().parse::<f64>() {
+                        tab_stops.push(v);
+                    }
+                }
+                self.current_paragraph.properties.tab_stops = tab_stops;
+                i = k;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Parse legacy strikethrough: \b{n};
+    fn parse_legacy_strikethrough(&mut self) {
+        let value_str = self.parse_semicolon_value();
+        if let Ok(n) = value_str.trim().parse::<u8>() {
+            self.current_props_mut().set_strikethrough(n == 1);
+        }
+    }
+
+    /// Skip a value up to the next `;` without processing.
+    fn skip_semicolon_value(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos] != ';' {
+            self.pos += 1;
+        }
+        if self.pos < self.chars.len() && self.chars[self.pos] == ';' {
+            self.pos += 1; // skip ';'
+        }
+    }
+
+    // ========================================================================
+    // Helper parsers
+    // ========================================================================
+
+    /// Parse a value up to the next `;`.
+    fn parse_semicolon_value(&mut self) -> String {
+        let mut value = String::new();
+        while self.pos < self.chars.len() && self.chars[self.pos] != ';' {
+            value.push(self.chars[self.pos]);
+            self.pos += 1;
+        }
+        if self.pos < self.chars.len() && self.chars[self.pos] == ';' {
+            self.pos += 1; // skip ';'
+        }
+        value
+    }
+
+    /// Parse a value up to the next `;`, also capturing a trailing `x`/`X`
+    /// suffix for relative values.
+    fn parse_semicolon_value_or_x(&mut self) -> String {
+        let mut value = String::new();
+        while self.pos < self.chars.len()
+            && self.chars[self.pos] != ';'
+            && self.chars[self.pos] != 'x'
+            && self.chars[self.pos] != 'X'
+        {
+            value.push(self.chars[self.pos]);
+            self.pos += 1;
+        }
+        // Check for x/X suffix (relative)
+        if self.pos < self.chars.len()
+            && (self.chars[self.pos] == 'x' || self.chars[self.pos] == 'X')
+        {
+            value.push(self.chars[self.pos]);
+            self.pos += 1;
+        }
+        // Skip trailing ';'
+        if self.pos < self.chars.len() && self.chars[self.pos] == ';' {
+            self.pos += 1;
+        }
+        value
+    }
+
+    /// Parse a numeric value up to the next `;`.
+    /// Only consumes characters if they form a valid signed integer.
+    fn parse_numeric_semicolon_value(&mut self) -> Option<i32> {
+        if self.pos < self.chars.len() && self.chars[self.pos] == ';' {
+            self.pos += 1;
+            return None;
+        }
+
+        let start = self.pos;
+        let value = self.parse_semicolon_value();
+
+        if let Ok(n) = value.parse::<i32>() {
+            Some(n)
+        } else {
+            self.pos = start;
+            None
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Basic parsing
+    // ========================================================================
+
+    #[test]
+    fn test_parse_empty() {
+        let doc = parse_mtext("", false);
+        assert!(doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_plain_text_no_braces() {
+        let doc = parse_mtext("Hello World", false);
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Hello World");
+        assert!(doc.paragraphs[0].spans[0].is_plain());
+    }
+
+    #[test]
+    fn test_parse_plain_text_with_paragraph() {
+        let doc = parse_mtext("Line1\\PLine2", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Line1");
+        assert_eq!(doc.paragraphs[1].to_plain_text(), "Line2");
+    }
+
+    #[test]
+    fn test_parse_braced_simple() {
+        let doc = parse_mtext("{Hello}", false);
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Hello");
+    }
+
+    // ========================================================================
+    // Color
+    // ========================================================================
+
+    #[test]
+    fn test_parse_color_single() {
+        let doc = parse_mtext(r"{\C1;Red}", false);
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Red");
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_parse_color_reset() {
+        let doc = parse_mtext(r"{\C1;Red\C0;; normal}", false);
+        assert_eq!(doc.paragraphs[0].spans.len(), 2);
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Red");
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(doc.paragraphs[0].spans[1].text, " normal");
+        // After \C0;; the color is reset to None (by-block/default)
+        assert!(doc.paragraphs[0].spans[1].properties.color.is_none());
+    }
+
+    #[test]
+    fn test_parse_rgb_color_blue() {
+        // BGR packed 255 = (B=255,G=0,R=0) → RGB (0,0,255) = BLUE
+        let doc = parse_mtext(r"{\c255;Blue}", false);
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color_rgb,
+            Some((0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn test_parse_rgb_color_green() {
+        // BGR packed 65280 = (B=0,G=255,R=0) → RGB (0,255,0) = GREEN
+        let doc = parse_mtext(r"{\c65280;Green}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color_rgb,
+            Some((0, 255, 0))
+        );
+    }
+
+    #[test]
+    fn test_parse_rgb_color_red() {
+        // BGR packed 16711680 = (B=0,G=0,R=255) → RGB (255,0,0) = RED
+        let doc = parse_mtext(r"{\c16711680;Red}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color_rgb,
+            Some((255, 0, 0))
+        );
+    }
+
+    // ========================================================================
+    // Stroke decorations
+    // ========================================================================
+
+    #[test]
+    fn test_parse_underline_on() {
+        let doc = parse_mtext(r"{\LUnderlined}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.underline());
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Underlined");
+    }
+
+    #[test]
+    fn test_parse_underline_toggle() {
+        // \L underline on, \l underline off
+        let doc = parse_mtext(r"{\LUnder\lNormal}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.underline());
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Under");
+        assert!(!doc.paragraphs[0].spans[1].properties.underline());
+        assert_eq!(doc.paragraphs[0].spans[1].text, "Normal");
+    }
+
+    #[test]
+    fn test_parse_overline_on() {
+        let doc = parse_mtext(r"{\OOverlined}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.overline());
+    }
+
+    #[test]
+    fn test_parse_overline_toggle() {
+        // \O overline on, \o overline off
+        let doc = parse_mtext(r"{\OOver\oNormal}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.overline());
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Over");
+        assert!(!doc.paragraphs[0].spans[1].properties.overline());
+    }
+
+    #[test]
+    fn test_parse_strikethrough_on() {
+        let doc = parse_mtext(r"{\KStruck}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.strikethrough());
+    }
+
+    #[test]
+    fn test_parse_strikethrough_toggle() {
+        // \K strikethrough on, \k strikethrough off
+        let doc = parse_mtext(r"{\KStruck\kNormal}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.strikethrough());
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Struck");
+        assert!(!doc.paragraphs[0].spans[1].properties.strikethrough());
+    }
+
+    #[test]
+    fn test_parse_legacy_strikethrough() {
+        let doc = parse_mtext(r"{\b1;Struck}", false);
+        assert!(doc.paragraphs[0].spans[0].properties.strikethrough());
+
+        let doc = parse_mtext(r"{\b0;Normal}", false);
+        assert!(!doc.paragraphs[0].spans[0].properties.strikethrough());
+    }
+
+    // ========================================================================
+    // Font
+    // ========================================================================
+
+    #[test]
+    fn test_parse_font_code() {
+        let doc = parse_mtext(r"{\fArial|b1|i0;Bold}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .name,
+            "Arial"
+        );
+        assert!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .bold
+        );
+        assert!(
+            !doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .italic
+        );
+    }
+
+    #[test]
+    fn test_parse_font_uppercase_f() {
+        // \F (uppercase) works as font alias like \f
+        let doc = parse_mtext(r"{\Fkroeger|b0|i0|c238|p10;Text}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .name,
+            "kroeger"
+        );
+        assert!(
+            !doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .bold
+        );
+        assert!(
+            !doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .italic
+        );
+    }
+
+    #[test]
+    fn test_parse_font_bold_italic() {
+        let doc = parse_mtext(r"{\fArial|b1|i1;BI}", false);
+        assert!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .bold
+        );
+        assert!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .italic
+        );
+    }
+
+    #[test]
+    fn test_parse_font_shx() {
+        let doc = parse_mtext(r"{\FNromans.shx;Text}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0]
+                .properties
+                .font
+                .as_ref()
+                .unwrap()
+                .name,
+            "romans.shx"
+        );
+    }
+
+    // ========================================================================
+    // Height
+    // ========================================================================
+
+    #[test]
+    fn test_parse_height_absolute() {
+        let doc = parse_mtext(r"{\H2;Big}", false);
+        assert_eq!(doc.paragraphs[0].spans[0].properties.height, Some(2.0));
+    }
+
+    #[test]
+    fn test_parse_height_relative() {
+        let doc = parse_mtext(r"{\H2x;Bigger}", false);
+        assert_eq!(doc.paragraphs[0].spans[0].properties.height, Some(2.0));
+    }
+
+    // ========================================================================
+    // Width
+    // ========================================================================
+
+    #[test]
+    fn test_parse_width_factor() {
+        let doc = parse_mtext(r"{\W1.5;Wide}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.width_factor,
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn test_parse_width_relative() {
+        let doc = parse_mtext(r"{\W0.5x;Narrow}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.width_factor,
+            Some(0.5)
+        );
+    }
+
+    // ========================================================================
+    // Tracking
+    // ========================================================================
+
+    #[test]
+    fn test_parse_tracking_positive() {
+        let doc = parse_mtext(r"{\T100;Spread}", false);
+        assert_eq!(doc.paragraphs[0].spans[0].properties.tracking, Some(100.0));
+    }
+
+    #[test]
+    fn test_parse_tracking_negative() {
+        let doc = parse_mtext(r"{\T-50;Condense}", false);
+        assert_eq!(doc.paragraphs[0].spans[0].properties.tracking, Some(-50.0));
+    }
+
+    // ========================================================================
+    // Oblique
+    // ========================================================================
+
+    #[test]
+    fn test_parse_oblique_positive() {
+        let doc = parse_mtext(r"{\Q15;Slanted}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.oblique_angle,
+            Some(15.0)
+        );
+    }
+
+    // ========================================================================
+    // Line alignment
+    // ========================================================================
+
+    #[test]
+    fn test_parse_line_align_bottom() {
+        let doc = parse_mtext(r"{\A0;Bottom}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.line_align,
+            Some(MTextLineAlignment::Bottom)
+        );
+    }
+
+    #[test]
+    fn test_parse_line_align_middle() {
+        let doc = parse_mtext(r"{\A1;Middle}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.line_align,
+            Some(MTextLineAlignment::Middle)
+        );
+    }
+
+    #[test]
+    fn test_parse_line_align_top() {
+        let doc = parse_mtext(r"{\A2;Top}", false);
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.line_align,
+            Some(MTextLineAlignment::Top)
+        );
+    }
+
+    // ========================================================================
+    // Stacking
+    // ========================================================================
+
+    #[test]
+    fn test_parse_stacking_fraction() {
+        let doc = parse_mtext(r"{\S1/4;}", false);
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans[0].text, "1/4");
+        assert!(doc.paragraphs[0].spans[0].stacking.is_some());
+        let stack = doc.paragraphs[0].spans[0].stacking.as_ref().unwrap();
+        assert_eq!(stack.numerator, "1");
+        assert_eq!(stack.denominator, "4");
+        assert_eq!(stack.stacking_type, StackingType::Horizontal);
+    }
+
+    #[test]
+    fn test_parse_stacking_diagonal() {
+        let doc = parse_mtext(r"{\S1#4;}", false);
+        let stack = doc.paragraphs[0].spans[0].stacking.as_ref().unwrap();
+        assert_eq!(stack.stacking_type, StackingType::Diagonal);
+    }
+
+    #[test]
+    fn test_parse_stacking_limit() {
+        let doc = parse_mtext(r"{\Smax^ n;}", false);
+        let stack = doc.paragraphs[0].spans[0].stacking.as_ref().unwrap();
+        assert_eq!(stack.stacking_type, StackingType::Limit);
+        assert_eq!(stack.numerator, "max");
+        // space after ^ is consumed
+        assert_eq!(stack.denominator, "n");
+    }
+
+    // ========================================================================
+    // Special characters
+    // ========================================================================
+
+    #[test]
+    fn test_parse_special_degree() {
+        let doc = parse_mtext("{%%d}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "°");
+    }
+
+    #[test]
+    fn test_parse_special_plus_minus() {
+        let doc = parse_mtext("{%%p}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "±");
+    }
+
+    #[test]
+    fn test_parse_special_diameter() {
+        let doc = parse_mtext("{%%c}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Ø");
+    }
+
+    #[test]
+    fn test_parse_special_percent() {
+        let doc = parse_mtext("{%%%%}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "%");
+    }
+
+    // ========================================================================
+    // Paragraph breaks
+    // ========================================================================
+
+    #[test]
+    fn test_parse_multiple_paragraphs() {
+        let doc = parse_mtext("{Para1\\PPara2}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Para1");
+        assert_eq!(doc.paragraphs[1].to_plain_text(), "Para2");
+    }
+
+    #[test]
+    fn test_parse_new_column() {
+        let doc = parse_mtext("{Col1\\NCol2}", false);
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "Col1");
+        assert_eq!(doc.paragraphs[1].to_plain_text(), "Col2");
+    }
+
+    // ========================================================================
+    // Unicode escape
+    // ========================================================================
+
+    #[test]
+    fn test_parse_unicode_escape() {
+        let doc = parse_mtext(r"{\U+00B0}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "°");
+    }
+
+    // ========================================================================
+    // Non-breaking space
+    // ========================================================================
+
+    #[test]
+    fn test_parse_nbsp() {
+        let doc = parse_mtext("{a\\~b}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "a\u{00A0}b");
+    }
+
+    // ========================================================================
+    // Escaping
+    // ========================================================================
+
+    #[test]
+    fn test_parse_escaped_backslash() {
+        // {\\\\} = { \\ } → one escaped backslash → "\"
+        let doc = parse_mtext("{\\\\}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "\\");
+    }
+
+    #[test]
+    fn test_parse_escaped_braces() {
+        // {\\{\\}} → { \{ \} } → literal { and }
+        let doc = parse_mtext("{\\{\\}}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "{}");
+    }
+
+    // ========================================================================
+    // Style groups
+    // ========================================================================
+
+    #[test]
+    fn test_parse_nested_groups() {
+        // Outer {C1} gets C1, Inner {C2} gets C2, after pop we get C1 again
+        let doc = parse_mtext("{\\C1;Outer{\\C2;Inner}Outer}", false);
+        // After pop, style changes so "Outer" after pop is separate span
+        assert_eq!(doc.paragraphs[0].spans.len(), 3);
+        assert_eq!(doc.paragraphs[0].spans[0].text, "Outer");
+        assert_eq!(
+            doc.paragraphs[0].spans[0].properties.color,
+            Some(MTextColor::Index(1))
+        );
+        assert_eq!(doc.paragraphs[0].spans[1].text, "Inner");
+        assert_eq!(
+            doc.paragraphs[0].spans[1].properties.color,
+            Some(MTextColor::Index(2))
+        );
+        assert_eq!(doc.paragraphs[0].spans[2].text, "Outer");
+        assert_eq!(
+            doc.paragraphs[0].spans[2].properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn test_parse_style_inheritance() {
+        // Height set in outer group should be inherited
+        let doc = parse_mtext("{\\H2;Normal{\\C1;Colored}Back}", false);
+        // Normal has H2, Colored has H2+C1, Back has H2
+        assert_eq!(doc.paragraphs[0].spans[0].properties.height, Some(2.0));
+        assert_eq!(doc.paragraphs[0].spans[1].properties.height, Some(2.0));
+        assert_eq!(doc.paragraphs[0].spans[2].properties.height, Some(2.0));
+    }
+
+    // ========================================================================
+    // Paragraph properties
+    // ========================================================================
+
+    #[test]
+    fn test_parse_paragraph_align_center() {
+        let doc = parse_mtext("{\\pqc;Centered text}", false);
+        assert_eq!(
+            doc.paragraphs[0].properties.alignment,
+            Some(MTextParagraphAlignment::Center)
+        );
+    }
+
+    #[test]
+    fn test_parse_paragraph_align_right() {
+        let doc = parse_mtext("{\\pqr;Right text}", false);
+        assert_eq!(
+            doc.paragraphs[0].properties.alignment,
+            Some(MTextParagraphAlignment::Right)
+        );
+    }
+
+    #[test]
+    fn test_parse_paragraph_indent() {
+        let doc = parse_mtext("{\\pi2;Indented}", false);
+        assert_eq!(doc.paragraphs[0].properties.first_line_indent, Some(2.0));
+    }
+
+    #[test]
+    fn test_parse_paragraph_spacing_before() {
+        let doc = parse_mtext("{\\pb0.5;Text}", false);
+        assert_eq!(doc.paragraphs[0].properties.spacing_before, Some(0.5));
+    }
+
+    #[test]
+    fn test_parse_paragraph_spacing_after() {
+        let doc = parse_mtext("{\\pa0.3;Text}", false);
+        assert_eq!(doc.paragraphs[0].properties.spacing_after, Some(0.3));
+    }
+
+    #[test]
+    fn test_parse_paragraph_line_spacing_exact() {
+        let doc = parse_mtext("{\\pse0.3;Text}", false);
+        assert_eq!(
+            doc.paragraphs[0].properties.line_spacing,
+            Some(MTextLineSpacing::Exact(0.3))
+        );
+    }
+
+    #[test]
+    fn test_parse_paragraph_line_spacing_multiple() {
+        let doc = parse_mtext("{\\psm1.5;Text}", false);
+        assert_eq!(
+            doc.paragraphs[0].properties.line_spacing,
+            Some(MTextLineSpacing::Multiple(1.5))
+        );
+    }
+
+    #[test]
+    fn test_parse_paragraph_tab_stops() {
+        let doc = parse_mtext("{\\pt3,6,9;Text}", false);
+        assert_eq!(doc.paragraphs[0].properties.tab_stops, vec![3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn test_parse_paragraph_all_properties() {
+        // Real-world example: indent, margins, spacing, line spacing, tabs
+        let doc = parse_mtext("{\\pi2,l0.8,r3.2,b0.4,a0.3,se0.5,t3,6;Text}", false);
+        assert_eq!(doc.paragraphs[0].properties.first_line_indent, Some(2.0));
+        assert_eq!(doc.paragraphs[0].properties.left_margin, Some(0.8));
+        assert_eq!(doc.paragraphs[0].properties.right_margin, Some(3.2));
+        assert_eq!(doc.paragraphs[0].properties.spacing_before, Some(0.4));
+        assert_eq!(doc.paragraphs[0].properties.spacing_after, Some(0.3));
+        assert_eq!(
+            doc.paragraphs[0].properties.line_spacing,
+            Some(MTextLineSpacing::Exact(0.5))
+        );
+        assert_eq!(doc.paragraphs[0].properties.tab_stops, vec![3.0, 6.0]);
+    }
+
+    #[test]
+    fn test_roundtrip_paragraph_properties() {
+        let doc = parse_mtext("{\\pi2,l0.8,r3.2,b0.4,a0.3,se0.5,t3,6;Text}", false);
+        let output = doc.to_mtext_string();
+        assert!(output.contains("\\p"));
+        assert!(output.contains("i2"));
+        assert!(output.contains("l0.8"));
+        assert!(output.contains("b0.4"));
+        assert!(output.contains("a0.3"));
+        assert!(output.contains("se0.5"));
+        assert!(output.contains("t3,6"));
+    }
+
+    // ========================================================================
+    // Complex real-world examples
+    // ========================================================================
+
+    #[test]
+    fn test_parse_complex_mtext() {
+        let doc = parse_mtext(
+            "{\\fArial|b1|i0;{\\H2.0;{\\C1;DIMENSION}}{\\H0.8;{\\C3;NOTE}}}",
+            false,
+        );
+        assert!(!doc.is_empty());
+        assert!(!doc.paragraphs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_real_world_dimension() {
+        let doc = parse_mtext(r"{\S1/4;%%c 20}", false);
+        // Should parse stacking + diameter symbol
+        assert!(!doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_real_world_tolerance() {
+        let doc = parse_mtext(r"{10.0 \S+0.05/-0.02;}", false);
+        assert!(!doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_many_paragraphs() {
+        // 20 paragraphs + trailing \P creates 21 (last empty)
+        let input: String = (0..20).map(|i| format!("Para{}\\P", i)).collect();
+        let doc = parse_mtext(&input, false);
+        assert_eq!(doc.paragraphs.len(), 21);
+    }
+
+    #[test]
+    fn test_parse_many_color_changes() {
+        let input: String = (0..10)
+            .map(|i| format!("{{\\C{};Text{}}}", (i % 7) + 1, i))
+            .collect();
+        let doc = parse_mtext(&input, false);
+        assert!(!doc.is_empty());
+    }
+
+    // ========================================================================
+    // Edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_parse_backslash_at_end() {
+        // \} is an escaped brace → literal }
+        let doc = parse_mtext(r"{hello\}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "hello}");
+    }
+
+    #[test]
+    fn test_parse_control_code_at_end() {
+        let doc = parse_mtext(r"{hello\C1;}", false);
+        assert!(!doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unknown_control_code() {
+        let doc = parse_mtext(r"{hello\Ztest}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "hello\\Ztest");
+    }
+
+    #[test]
+    fn test_parse_unclosed_brace() {
+        let doc = parse_mtext("{hello", false);
+        assert!(!doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_empty_braces() {
+        let doc = parse_mtext("{}", false);
+        assert!(doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_only_special_chars() {
+        let doc = parse_mtext("{%%d%%p%%c}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "°±Ø");
+    }
+
+    #[test]
+    fn test_parse_single_percent() {
+        let doc = parse_mtext("{%}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "%");
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_braces() {
+        // {{\\{\\{\\}}} → nested groups with escaped braces/backslash
+        let doc = parse_mtext("{{\\{\\}}", false);
+        assert!(!doc.is_empty());
+    }
+
+    #[test]
+    fn test_parse_consecutive_percents() {
+        let doc = parse_mtext("{%%d%%d}", false);
+        assert_eq!(doc.paragraphs[0].to_plain_text(), "°°");
+    }
+
+    // ========================================================================
+    // Merge spans
+    // ========================================================================
+
+    #[test]
+    fn test_parse_with_merge_spans() {
+        let doc = parse_mtext(r"({\C1;Red more})", false);
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_without_merge_spans() {
+        let doc = parse_mtext(r"({\C1;Red more})", true);
+        // merge_spans=true should merge adjacent same-style text
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+    }
+
+    // ========================================================================
+    // Roundtrip
+    // ========================================================================
+
+    #[test]
+    fn test_roundtrip_simple_formatted() {
+        let doc = parse_mtext("{\\C1;Red\\C0;; normal}", false);
+        let s = doc.to_mtext_string();
+        assert!(s.contains("\\C1;;"));
+    }
+
+    #[test]
+    fn test_roundtrip_escaped_chars() {
+        let doc = parse_mtext("{\\\\}", false);
+        let s = doc.to_mtext_string();
+        assert!(s.contains("\\"));
+    }
+}

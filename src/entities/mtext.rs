@@ -108,6 +108,53 @@ impl MText {
         self.rectangle_width = width;
         self
     }
+
+    /// Parse the MTEXT value into a structured document.
+    ///
+    /// This parses the RTF-like formatting codes in the MTEXT value
+    /// and returns an [`MTextDocument`](mtext_format::MTextDocument)
+    /// containing paragraphs and styled spans.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use acadrust::entities::MText;
+    ///
+    /// let mut mtext = MText::new();
+    /// mtext.value = "{\\C1;Red\\C0;;Normal}".to_string();
+    ///
+    /// let doc = mtext.parse_format();
+    /// assert_eq!(doc.paragraphs.len(), 1);
+    /// assert_eq!(doc.paragraphs[0].spans.len(), 2);
+    /// ```
+    pub fn parse_format(&self) -> super::mtext_format::MTextDocument {
+        super::mtext_format::parse_mtext(&self.value, true)
+    }
+
+    /// Serialize a structured document back to MTEXT format and set it as the value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use acadrust::entities::MText;
+    /// use acadrust::entities::mtext_format::{MTextDocument, MTextParagraph, MTextSpan, SpanProperties, MTextColor};
+    ///
+    /// let mut mtext = MText::new();
+    ///
+    /// let mut doc = MTextDocument::new();
+    /// let mut para = MTextParagraph::new();
+    /// let mut props = SpanProperties::default();
+    /// props.color = Some(MTextColor::Index(1));
+    /// para.push_span(MTextSpan::new("Red", props));
+    /// para.push_span(MTextSpan::plain(" text"));
+    /// doc.push_paragraph(para);
+    ///
+    /// mtext.set_format(&doc);
+    /// assert!(mtext.value.contains("\\C1;;"));
+    /// ```
+    pub fn set_format(&mut self, document: &super::mtext_format::MTextDocument) {
+        self.value = document.to_mtext_string();
+    }
 }
 
 impl Default for MText {
